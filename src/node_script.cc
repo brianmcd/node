@@ -143,9 +143,10 @@ class WrappedContext : ObjectWrap {
     // TODO: explain these TODO: can this stillhappen?
     if (ctx == NULL) return scope.Close(v8::Undefined()); 
     Local<Value> rv = ctx->host_->GetRealNamedProperty(property);
-    if (rv.IsEmpty()) {
+    if (rv.IsEmpty())
       rv = ctx->proxy_global_->GetRealNamedProperty(property);
-    }
+    if (!rv.IsEmpty() && rv->StrictEquals(ctx->host_))
+      rv = Local<Value>::New(ctx->proxy_global_);
     return scope.Close(rv);
   }
 
