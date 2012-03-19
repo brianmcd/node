@@ -48,6 +48,9 @@ using v8::Boolean;
 using v8::None;
 using v8::ObjectTemplate;
 
+Persistent<FunctionTemplate> data_wrapper_tmpl; // TODO: need to be here?
+Persistent<Function> data_wrapper_ctor; // TODO: placement
+
 class WrappedContext : ObjectWrap {
  public:
   static void Initialize(Handle<Object> target);
@@ -57,26 +60,50 @@ class WrappedContext : ObjectWrap {
   static Local<Object> NewInstance(const Arguments& args);// TODO: only pass sandbox, not all args.
   static bool InstanceOf(Handle<Value> value);
 
+  // This is an object that just keeps an internal pointer to this
+  // ContextifyContext.  It's passed to the NamedPropertyHandler.  If we
+  // pass the main JavaScript context object we're embedded in, then the
+  // NamedPropertyHandler will store a reference to it forever and keep it
+  // from getting gc'd.
+  // TODO: should this warp a ref to host instead?
+  Handle<Object> GetOrCreateDataWrapper () {
+    HandleScope scope;
+    if (data_wrapper_.IsEmpty()) {
+      if (data_wrapper_ctor.IsEmpty()) {
+        // TODO: 80 chars
+        // TODO: try scoping data_wrapper_tmpl to here and call it tmpl.
+        data_wrapper_tmpl = Persistent<FunctionTemplate>::New(FunctionTemplate::New());
+        data_wrapper_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+        data_wrapper_ctor = Persistent<Function>::New(data_wrapper_tmpl->GetFunction());
+      }
+      data_wrapper_ = Persistent<Object>::New(data_wrapper_ctor->NewInstance());
+      data_wrapper_->SetPointerInInternalField(0, this);
+      data_wrapper_.MakeWeak(NULL, WeakCallback);
+    }
+    return data_wrapper_;
+  }
+
  //protected: TODO
 
   static Persistent<FunctionTemplate> constructor_template;
 
   Persistent<Context> context_;
   Persistent<Object>  proxy_global_;
-  //Persistent<Object>  host_;
+  Persistent<Object>  host_;
+  Persistent<Object>  data_wrapper_;
 
-  static void HostObjectWeakCallback(Persistent<Value> host, void* param) {
-    printf("Cleaning up host object\n");
-    host.ClearWeak();
-    host->ToObject()->SetPointerInInternalField(0, NULL);
-    host.Dispose();
-    host.Clear();
+  static void WeakCallback(Persistent<Value> obj, void* param) {
+    obj.ClearWeak();
+    // TODO: this is weird with the host object...ObjectWrap does this stuff.
+    obj->ToObject()->SetPointerInInternalField(0, NULL);
+    obj.Dispose();
+    obj.Clear();
   }
 
   WrappedContext(Persistent<Object> host);
   ~WrappedContext();
 
-  Persistent<Context> CreateV8Context(Handle<Object> host) {
+  Persistent<Context> CreateV8Context() {
     HandleScope scope;
     Local<FunctionTemplate> ftmpl = FunctionTemplate::New();
     ftmpl->SetHiddenPrototype(true);
@@ -87,7 +114,7 @@ class WrappedContext : ObjectWrap {
                                    GlobalPropertyQuery,
                                    GlobalPropertyDeleter,
                                    GlobalPropertyEnumerator,
-                                   host);
+                                   GetOrCreateDataWrapper());
     otmpl->SetAccessCheckCallbacks(GlobalPropertyNamedAccessCheck,
                                    GlobalPropertyIndexedAccessCheck);
     return Context::New(NULL, otmpl);
@@ -111,11 +138,12 @@ class WrappedContext : ObjectWrap {
   static Handle<Value> GlobalPropertyGetter(Local<String> property,
                                             const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> host = access_info.Data()->ToObject();
-    Local<Value> rv = host->GetRealNamedProperty(property);
+    Local<Object> data = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    // TODO: explain these TODO: can this stillhappen?
+    if (ctx == NULL) return scope.Close(v8::Undefined()); 
+    Local<Value> rv = ctx->host_->GetRealNamedProperty(property);
     if (rv.IsEmpty()) {
-      WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-      if (ctx == NULL) return scope.Close(v8::Undefined());  // TODO: explain these TODO: can this stil happen?
       rv = ctx->proxy_global_->GetRealNamedProperty(property);
     }
     return scope.Close(rv);
@@ -125,43 +153,49 @@ class WrappedContext : ObjectWrap {
                                             Local<Value> value,
                                             const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> host = access_info.Data()->ToObject();
-    host->Set(property, value);
+    Local<Object> data = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    // TODO: explain these TODO: can this stillhappen?
+    if (ctx == NULL) return scope.Close(v8::Undefined()); 
+    ctx->host_->Set(property, value);
     return scope.Close(value);
   }
 
   static Handle<Integer> GlobalPropertyQuery(Local<String> property,
                                              const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> host = access_info.Data()->ToObject();
-    if (!host->GetRealNamedProperty(property).IsEmpty())
-      return scope.Close(Integer::New(None));
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(Handle<Integer>()); // TODO
-    if (!ctx->proxy_global_->GetRealNamedProperty(property).IsEmpty())
+    Local<Object> data = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    // TODO: explain these TODO: can this stillhappen?
+    if (ctx == NULL) return scope.Close(Handle<Integer>()); 
+    if (!ctx->host_->GetRealNamedProperty(property).IsEmpty() ||
+        !ctx->proxy_global_->GetRealNamedProperty(property).IsEmpty())
       return scope.Close(Integer::New(None));
     return scope.Close(Handle<Integer>());
   }
 
-  // TODO: only unwrap if prop not on host.
   static Handle<Boolean> GlobalPropertyDeleter(Local<String> property,
                                                const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> host = access_info.Data()->ToObject();
-    bool success = host->Delete(property);
-    if (!success) {
-      WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-      if (ctx == NULL) return scope.Close(v8::False());
+    Local<Object> data = access_info.Data()->ToObject();
+    // TODO: think about factoring unwrap out to an inline
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    // TODO: explain these TODO: can this stillhappen?
+    if (ctx == NULL) return scope.Close(v8::False()); // TODO: need to remove v8::'s
+    bool success = ctx->host_->Delete(property);
+    if (!success)
       success = ctx->proxy_global_->Delete(property);
-    }
     return scope.Close(Boolean::New(success));
   }
 
   // TODO: this should merge the arrays from the real props of proxy and host.
   static Handle<Array> GlobalPropertyEnumerator(const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> host = access_info.Data()->ToObject();
-    return scope.Close(host->GetPropertyNames());
+    Local<Object> data = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    // TODO: explain these TODO: can this stillhappen?
+    if (ctx == NULL) return scope.Close(Array::New()); // TODO: need to remove v8::'s
+    return scope.Close(ctx->host_->GetPropertyNames());
   }
 };
 
@@ -264,7 +298,7 @@ Handle<Value> WrappedContext::New(const Arguments& args) {
   Local<Object> sandbox = args[0]->ToObject();
   CloneObject(args.This(), sandbox, args.This());
   Persistent<Object> host = Persistent<Object>::New(args.This());
-  host.MakeWeak(NULL, HostObjectWeakCallback);
+  host.MakeWeak(NULL, WeakCallback);
   WrappedContext *ctx = new WrappedContext(host);
   ctx->Wrap(args.This());
   return args.This();
@@ -273,17 +307,18 @@ Handle<Value> WrappedContext::New(const Arguments& args) {
 
 // TODO: should these be handle, not local?
 WrappedContext::WrappedContext(Persistent<Object> host) : ObjectWrap() {
-  context_ = CreateV8Context(host);
+  host_ = host;
+  context_ = CreateV8Context();
   proxy_global_ = Persistent<Object>::New(context_->Global());
 }
 
 
 WrappedContext::~WrappedContext() {
-  printf("~WrappedContext\n");
   context_.Dispose();
   context_.Clear();
   proxy_global_.Dispose();
   proxy_global_.Clear();
+  data_wrapper_->SetPointerInInternalField(0, NULL);
 }
 
 
@@ -378,9 +413,7 @@ WrappedScript::~WrappedScript() {
 
 Handle<Value> WrappedScript::CreateContext(const Arguments& args) {
   HandleScope scope;
- //printf("Entering WrappedScript::CreateContext\n");
   Local<Object> context = WrappedContext::NewInstance(args);
- //printf("Leaving WrappedScript::CreateContext\n");
   return scope.Close(context);
 }
 
@@ -426,7 +459,6 @@ template <WrappedScript::EvalInputFlags input_flag,
           WrappedScript::EvalOutputFlags output_flag>
 Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
   HandleScope scope;
- //printf("Entering EvalMachine\n");
 
   if (input_flag == compileCode && args.Length() < 1) {
     return ThrowException(Exception::TypeError(
@@ -474,7 +506,6 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
     // Create the new context
     context = Context::New();
   } else if (context_flag == userContext) {
-   //printf("Using a user context\n");
     // Use the passed in context
     WrappedContext *nContext = ObjectWrap::Unwrap<WrappedContext>(sandbox);
     context = nContext->GetV8Context();
@@ -527,20 +558,15 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
   if (output_flag == returnResult) {
     result = script->Run();
     if (result.IsEmpty()) {
-     //printf("Error running script\n");
       if (context_flag == newContext) {
-       //printf("Cleaning up NEW context\n");
         context->DetachGlobal();
         context->Exit();
         context.Dispose();
       } else if (context_flag == userContext) {
-       //printf("Exiting USER context\n");
         context->Exit();
       }
-     //printf("Returning\n");
       return try_catch.ReThrow();
     }
-   //printf("Script ran successfully\n");
   } else {
     WrappedScript *n_script = ObjectWrap::Unwrap<WrappedScript>(args.Holder());
     if (!n_script) {
@@ -552,19 +578,16 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
   }
 
   if (context_flag == newContext) {
-    //printf("After run, cleaning up NEW context\n");
     // success! copy changes back onto the sandbox object.
     CloneObject(args.This(), context->Global()->GetPrototype(), sandbox);
     context->DetachGlobal();
     context->Exit();
     context.Dispose();
   } else if (context_flag == userContext) {
-    //printf("After run, cleaning up USER context\n");
     // Exit the passed in context.
     context->Exit();
   }
 
- //printf("Leaving EvalMachine\n");
   return result == args.This() ? result : scope.Close(result);
 }
 
