@@ -29,4 +29,4 @@ var ctx = vm.createContext(sandbox);
 
 assert.equal(vm.runInContext('x;', ctx), 3);
 vm.runInContext('y = 4;', ctx);
-assert.equal(sandbox.y, 4);
+assert.equal(ctx.y, 4);

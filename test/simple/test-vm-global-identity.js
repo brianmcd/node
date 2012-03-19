@@ -23,6 +23,7 @@ var common = require('../common');
 var assert = require('assert');
 var vm = require('vm');
 
-var ctx = vm.createContext({});
+var ctx = vm.createContext();
+ctx.window = ctx;
 
-assert.strictEqual(vm.runInContext('this;', ctx), ctx);
+assert.ok(vm.runInContext('this;', ctx) === vm.runInContext('window;', ctx));

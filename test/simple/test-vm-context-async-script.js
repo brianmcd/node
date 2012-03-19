@@ -29,5 +29,5 @@ var ctx = vm.createContext(sandbox);
 
 vm.runInContext('setTimeout(function () { x = 3;}, 0);', ctx);
 setTimeout(function () {
-    assert.equal(sandbox.x, 3);
+    assert.equal(ctx.x, 3);
 }, 1);

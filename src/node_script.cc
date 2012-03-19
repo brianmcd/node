@@ -62,32 +62,32 @@ class WrappedContext : ObjectWrap {
   static Persistent<FunctionTemplate> constructor_template;
 
   Persistent<Context> context_;
-  Persistent<Object>  sandbox_;
   Persistent<Object>  proxy_global_;
-  Persistent<Object>  host_;
+  //Persistent<Object>  host_;
 
   static void HostObjectWeakCallback(Persistent<Value> host, void* param) {
+    printf("Cleaning up host object\n");
     host.ClearWeak();
     host->ToObject()->SetPointerInInternalField(0, NULL);
     host.Dispose();
     host.Clear();
   }
 
-  WrappedContext(Local<Object> sandbox, Local<Object> host);
+  WrappedContext(Persistent<Object> host);
   ~WrappedContext();
 
-  Persistent<Context> CreateV8Context() {
+  Persistent<Context> CreateV8Context(Handle<Object> host) {
     HandleScope scope;
     Local<FunctionTemplate> ftmpl = FunctionTemplate::New();
     ftmpl->SetHiddenPrototype(true);
-    ftmpl->SetClassName(sandbox_->GetConstructorName());
+    //ftmpl->SetClassName(sandbox_->GetConstructorName()); TODO
     Local<ObjectTemplate> otmpl = ftmpl->InstanceTemplate();
     otmpl->SetNamedPropertyHandler(GlobalPropertyGetter,
                                    GlobalPropertySetter,
                                    GlobalPropertyQuery,
                                    GlobalPropertyDeleter,
                                    GlobalPropertyEnumerator,
-                                   host_);
+                                   host);
     otmpl->SetAccessCheckCallbacks(GlobalPropertyNamedAccessCheck,
                                    GlobalPropertyIndexedAccessCheck);
     return Context::New(NULL, otmpl);
@@ -112,10 +112,10 @@ class WrappedContext : ObjectWrap {
                                             const AccessorInfo &access_info) {
     HandleScope scope;
     Local<Object> host = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(v8::Undefined());  // TODO: explain these
-    Local<Value> rv = ctx->sandbox_->GetRealNamedProperty(property);
+    Local<Value> rv = host->GetRealNamedProperty(property);
     if (rv.IsEmpty()) {
+      WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
+      if (ctx == NULL) return scope.Close(v8::Undefined());  // TODO: explain these TODO: can this stil happen?
       rv = ctx->proxy_global_->GetRealNamedProperty(property);
     }
     return scope.Close(rv);
@@ -126,10 +126,7 @@ class WrappedContext : ObjectWrap {
                                             const AccessorInfo &access_info) {
     HandleScope scope;
     Local<Object> host = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(v8::Undefined());
-    ctx->sandbox_->Set(property, value);
-    host->Set(property, value); // TODO: For backwards compatibility.
+    host->Set(property, value);
     return scope.Close(value);
   }
 
@@ -137,35 +134,34 @@ class WrappedContext : ObjectWrap {
                                              const AccessorInfo &access_info) {
     HandleScope scope;
     Local<Object> host = access_info.Data()->ToObject();
+    if (!host->GetRealNamedProperty(property).IsEmpty())
+      return scope.Close(Integer::New(None));
     WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(Handle<Integer>());
-    if (!ctx->sandbox_->GetRealNamedProperty(property).IsEmpty() ||
-        !ctx->proxy_global_->GetRealNamedProperty(property).IsEmpty()) {
-        return scope.Close(Integer::New(None));
-    }
+    if (ctx == NULL) return scope.Close(Handle<Integer>()); // TODO
+    if (!ctx->proxy_global_->GetRealNamedProperty(property).IsEmpty())
+      return scope.Close(Integer::New(None));
     return scope.Close(Handle<Integer>());
   }
 
+  // TODO: only unwrap if prop not on host.
   static Handle<Boolean> GlobalPropertyDeleter(Local<String> property,
                                                const AccessorInfo &access_info) {
     HandleScope scope;
     Local<Object> host = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(v8::False());
-    bool success = ctx->sandbox_->Delete(property);
-    host->Delete(property); // TODO: For backwards compatibility.
+    bool success = host->Delete(property);
     if (!success) {
-        success = ctx->proxy_global_->Delete(property);
+      WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
+      if (ctx == NULL) return scope.Close(v8::False());
+      success = ctx->proxy_global_->Delete(property);
     }
     return scope.Close(Boolean::New(success));
   }
 
+  // TODO: this should merge the arrays from the real props of proxy and host.
   static Handle<Array> GlobalPropertyEnumerator(const AccessorInfo &access_info) {
     HandleScope scope;
     Local<Object> host = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
-    if (ctx == NULL) return scope.Close(Handle<Array>());
-    return scope.Close(ctx->sandbox_->GetPropertyNames());
+    return scope.Close(host->GetPropertyNames());
   }
 };
 
@@ -256,7 +252,6 @@ bool WrappedContext::InstanceOf(Handle<Value> value) {
 
 Handle<Value> WrappedContext::New(const Arguments& args) {
   HandleScope scope;
- //printf("In WrappedContext::New\n");
   // TODO: change to correct exception types.
   if (args.Length() < 1) {
       Local<String> msg = String::New("Wrong number of arguments passed to WrappedContext constructor");
@@ -267,19 +262,18 @@ Handle<Value> WrappedContext::New(const Arguments& args) {
       return ThrowException(Exception::Error(msg));
   }
   Local<Object> sandbox = args[0]->ToObject();
-  WrappedContext *ctx = new WrappedContext(sandbox, args.This());
+  CloneObject(args.This(), sandbox, args.This());
+  Persistent<Object> host = Persistent<Object>::New(args.This());
+  host.MakeWeak(NULL, HostObjectWeakCallback);
+  WrappedContext *ctx = new WrappedContext(host);
   ctx->Wrap(args.This());
-  CloneObject(args.This(), sandbox, args.This()); // TODO: For backwards compatability.
   return args.This();
 }
 
 
 // TODO: should these be handle, not local?
-WrappedContext::WrappedContext(Local<Object> sandbox, Local<Object> host) : ObjectWrap() {
-  sandbox_ = Persistent<Object>::New(sandbox);
-  host_ = Persistent<Object>::New(host);
-  host_.MakeWeak(NULL, HostObjectWeakCallback);
-  context_ = CreateV8Context();
+WrappedContext::WrappedContext(Persistent<Object> host) : ObjectWrap() {
+  context_ = CreateV8Context(host);
   proxy_global_ = Persistent<Object>::New(context_->Global());
 }
 
@@ -290,8 +284,6 @@ WrappedContext::~WrappedContext() {
   context_.Clear();
   proxy_global_.Dispose();
   proxy_global_.Clear();
-  sandbox_.Dispose();
-  sandbox_.Clear();
 }
 
 
