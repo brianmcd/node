@@ -48,10 +48,6 @@ using v8::Boolean;
 using v8::None;
 using v8::ObjectTemplate;
 
-// TODO: Do I need to expose tmpl?
-static Persistent<FunctionTemplate> data_wrapper_tmpl;
-static Persistent<Function>         data_wrapper_ctor;
-
 class WrappedContext : ObjectWrap {
  public:
   static void Initialize(Handle<Object> target);
@@ -68,9 +64,16 @@ class WrappedContext : ObjectWrap {
   Persistent<Context> context_;
   Persistent<Object>  sandbox_;
   Persistent<Object>  proxy_global_;
-  Persistent<Object>  data_wrapper_; // TODO: explain
+  Persistent<Object>  host_;
 
-  WrappedContext(Local<Object> sandbox);
+  static void HostObjectWeakCallback(Persistent<Value> host, void* param) {
+    host.ClearWeak();
+    host->ToObject()->SetPointerInInternalField(0, NULL);
+    host.Dispose();
+    host.Clear();
+  }
+
+  WrappedContext(Local<Object> sandbox, Local<Object> host);
   ~WrappedContext();
 
   Persistent<Context> CreateV8Context() {
@@ -84,7 +87,7 @@ class WrappedContext : ObjectWrap {
                                    GlobalPropertyQuery,
                                    GlobalPropertyDeleter,
                                    GlobalPropertyEnumerator,
-                                   data_wrapper_);
+                                   host_);
     otmpl->SetAccessCheckCallbacks(GlobalPropertyNamedAccessCheck,
                                    GlobalPropertyIndexedAccessCheck);
     return Context::New(NULL, otmpl);
@@ -108,10 +111,9 @@ class WrappedContext : ObjectWrap {
   static Handle<Value> GlobalPropertyGetter(Local<String> property,
                                             const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> data = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
-    // TODO: explain these
-    if (ctx == NULL) return scope.Close(v8::Undefined());
+    Local<Object> host = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
+    if (ctx == NULL) return scope.Close(v8::Undefined());  // TODO: explain these
     Local<Value> rv = ctx->sandbox_->GetRealNamedProperty(property);
     if (rv.IsEmpty()) {
       rv = ctx->proxy_global_->GetRealNamedProperty(property);
@@ -123,18 +125,19 @@ class WrappedContext : ObjectWrap {
                                             Local<Value> value,
                                             const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> data = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    Local<Object> host = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
     if (ctx == NULL) return scope.Close(v8::Undefined());
     ctx->sandbox_->Set(property, value);
+    host->Set(property, value); // TODO: For backwards compatibility.
     return scope.Close(value);
   }
 
   static Handle<Integer> GlobalPropertyQuery(Local<String> property,
                                              const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> data = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    Local<Object> host = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
     if (ctx == NULL) return scope.Close(Handle<Integer>());
     if (!ctx->sandbox_->GetRealNamedProperty(property).IsEmpty() ||
         !ctx->proxy_global_->GetRealNamedProperty(property).IsEmpty()) {
@@ -146,10 +149,11 @@ class WrappedContext : ObjectWrap {
   static Handle<Boolean> GlobalPropertyDeleter(Local<String> property,
                                                const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> data = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    Local<Object> host = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
     if (ctx == NULL) return scope.Close(v8::False());
     bool success = ctx->sandbox_->Delete(property);
+    host->Delete(property); // TODO: For backwards compatibility.
     if (!success) {
         success = ctx->proxy_global_->Delete(property);
     }
@@ -158,8 +162,8 @@ class WrappedContext : ObjectWrap {
 
   static Handle<Array> GlobalPropertyEnumerator(const AccessorInfo &access_info) {
     HandleScope scope;
-    Local<Object> data = access_info.Data()->ToObject();
-    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(data);
+    Local<Object> host = access_info.Data()->ToObject();
+    WrappedContext *ctx = ObjectWrap::Unwrap<WrappedContext>(host);
     if (ctx == NULL) return scope.Close(Handle<Array>());
     return scope.Close(ctx->sandbox_->GetPropertyNames());
   }
@@ -284,10 +288,6 @@ void WrappedContext::Initialize(Handle<Object> target) {
 
   target->Set(String::NewSymbol("Context"),
               constructor_template->GetFunction());
-
-  data_wrapper_tmpl = Persistent<FunctionTemplate>::New(FunctionTemplate::New());
-  data_wrapper_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
-  data_wrapper_ctor = Persistent<Function>::New(data_wrapper_tmpl->GetFunction());
 }
 
 
@@ -308,26 +308,19 @@ Handle<Value> WrappedContext::New(const Arguments& args) {
       Local<String> msg = String::New("Argument to WrappedContext constructor must be an object.");
       return ThrowException(Exception::Error(msg));
   }
-  WrappedContext *ctx = new WrappedContext(args[0]->ToObject());
+  Local<Object> sandbox = args[0]->ToObject();
+  WrappedContext *ctx = new WrappedContext(sandbox, args.This());
   ctx->Wrap(args.This());
+  CloneObject(args.This(), sandbox, args.This()); // TODO: For backwards compatability.
   return args.This();
 }
 
 
-WrappedContext::WrappedContext(Local<Object> sandbox) : ObjectWrap() {
- //printf("WrappedContext()\n");
-  
-  // This is an object that just keeps an internal pointer to this
-  // WrappedContext.  It's passed to the NamedPropertyHandler.  If we
-  // pass the main JavaScript context object we're embedded in, then the
-  // NamedPropertyHandler will store a reference to it forever and keep it
-  // from getting gc'd.
-  // TODO: the issue is that 'this' is getting deleted, then our data wrapper
-  //       tries to access it.  Use after free.
-  //       Only seems to happen with uncaught exceptions.
-  data_wrapper_ = Persistent<Object>::New(data_wrapper_ctor->NewInstance());
-  data_wrapper_->SetPointerInInternalField(0, this);
+// TODO: should these be handle, not local?
+WrappedContext::WrappedContext(Local<Object> sandbox, Local<Object> host) : ObjectWrap() {
   sandbox_ = Persistent<Object>::New(sandbox);
+  host_ = Persistent<Object>::New(host);
+  host_.MakeWeak(NULL, HostObjectWeakCallback);
   context_ = CreateV8Context();
   proxy_global_ = Persistent<Object>::New(context_->Global());
 }
@@ -341,19 +334,15 @@ WrappedContext::~WrappedContext() {
   proxy_global_.Clear();
   sandbox_.Dispose();
   sandbox_.Clear();
-  data_wrapper_->SetPointerInInternalField(0, NULL);
 }
 
 
 Local<Object> WrappedContext::NewInstance(const Arguments& args) {
   HandleScope scope;
   Handle<Value> argv[1];
- //printf("WrappedContext::NewInstance()\n");
   if (args.Length() > 0 && args[0]->IsObject()) {
-   //printf("Creating a new instance from a sandbox\n");
     argv[0] = args[0];
   } else {
-   //printf("Creating a new instace from an empty object\n");
     argv[0] = Object::New();
   }
   Local<Object> context = constructor_template->GetFunction()->NewInstance(1, argv);
